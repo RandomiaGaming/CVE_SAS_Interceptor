@@ -12,7 +12,7 @@ void PressAnyKey() {
 
 	SetConsoleMode(hStdin, originalConsoleMode & ~ENABLE_ECHO_INPUT);
 
-	_getch();
+	(void)_getch();
 
 	SetConsoleMode(hStdin, originalConsoleMode);
 }
@@ -152,7 +152,7 @@ int main() {
 			return 1;
 		}
 		else {
-			cout << "Running self as administrator." << endl;
+			cout << "Restarting as administrator with UAC." << endl;
 			return 0;
 		}
 	}
@@ -162,7 +162,7 @@ int main() {
 	}
 
 	if (!BreakWinlogon()) {
-		cerr << "Operation Failed :(" << endl;
+		cerr << "ERROR: Failed to pause execution of winlogon.exe." << endl;
 		return 1;
 	}
 
