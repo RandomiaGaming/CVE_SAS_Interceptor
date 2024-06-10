@@ -5,64 +5,55 @@
 using namespace std;
 
 void PressAnyKey() {
+	// Get a handle to the console.
 	HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
 
+	// Get the original console mode.
 	DWORD originalConsoleMode;
 	GetConsoleMode(hStdin, &originalConsoleMode);
 
+	// Set the console mode to not echo typed characters to the screen.
 	SetConsoleMode(hStdin, originalConsoleMode & ~ENABLE_ECHO_INPUT);
 
+	// Wait for the user to type a character.
 	(void)_getch();
 
+	// Restore the original console mode and return.
 	SetConsoleMode(hStdin, originalConsoleMode);
 }
 
 DWORD GetWinlogonPID() {
-	DWORD processID = 0;
-	const WCHAR* processName = L"winlogon.exe";
+	// Create a snapshot.
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	PROCESSENTRY32 processEntry;
+	processEntry.dwSize = sizeof(PROCESSENTRY32);
+	// Search through running processes using the snapshot.
+	Process32First(snapshot, &processEntry);
+	do {
+		// If the current process is winlogon.exe return its PID.
+		if (lstrcmp(processEntry.szExeFile, L"winlogon.exe") == 0) {
+			DWORD winlogonPID = processEntry.th32ProcessID;
+			CloseHandle(snapshot);
+			return winlogonPID;
+		}
+	} while (Process32Next(snapshot, &processEntry));
 
-	HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-	if (hSnapshot == INVALID_HANDLE_VALUE) {
-		return 0;
-	}
-
-	PROCESSENTRY32 pe32;
-	pe32.dwSize = sizeof(PROCESSENTRY32);
-
-	if (Process32First(hSnapshot, &pe32)) {
-		do {
-			if (lstrcmp(pe32.szExeFile, processName) == 0) {
-				processID = pe32.th32ProcessID;
-				break;
-			}
-		} while (Process32Next(hSnapshot, &pe32));
-	}
-	else {
-		return 0;
-	}
-
-	CloseHandle(hSnapshot);
-	return processID;
+	// Cleanup and return 0 because winlogon.exe could not be found.
+	CloseHandle(snapshot);
+	return 0;
 }
 
-bool BreakWinlogon() {
-	DWORD processID = GetWinlogonPID();
+void BreakWinlogon() {
+	DWORD winlogonPID = GetWinlogonPID();
 
-	if (!DebugActiveProcess(processID)) {
-		return false;
-	}
+	// Attach debugger to winlogon
+	DebugActiveProcess(winlogonPID);
 
-	HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, processID);
-	if (hProcess == NULL) {
-		DebugActiveProcessStop(processID);
-		return false;
-	}
+	// Open process handle to winlogon
+	HANDLE winlogonHandle = OpenProcess(PROCESS_ALL_ACCESS, FALSE, winlogonPID);
 
-	if (!DebugBreakProcess(hProcess)) {
-		CloseHandle(hProcess);
-		DebugActiveProcessStop(processID);
-		return false;
-	}
+	// Break winlogon
+	DebugBreakProcess(winlogonHandle);
 
 	cout << "Successfully paused execution of winlogon.exe" << endl;
 	cout << "Ctrl + Alt + Del (SAS) should be intercepted." << endl;
@@ -71,100 +62,84 @@ bool BreakWinlogon() {
 
 	PressAnyKey();
 
-	CloseHandle(hProcess);
-	DebugActiveProcessStop(processID);
+	// Detach debugger
+	DebugActiveProcessStop(winlogonPID);
 
-	return true;
+	// Free handle
+	CloseHandle(winlogonHandle);
 }
 
-bool TakeSEDebugPrivilege() {
-	HANDLE hToken = NULL;
+void TakeSEDebugPrivilege() {
+	// Get the current process token.
+	HANDLE currentToken = NULL;
+	OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &currentToken);
+
+	// Lookup the SE_Debug_Privilage luid.
+	LUID debugPrivilageLUID;
+	LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &debugPrivilageLUID);
+
+	// Grant ourselves the SE_Debug_Privilage.
 	TOKEN_PRIVILEGES tokenPrivileges;
-	LUID luid;
-
-	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
-		return false;
-	}
-
-	if (!LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &luid)) {
-		CloseHandle(hToken);
-		return false;
-	}
-
 	tokenPrivileges.PrivilegeCount = 1;
-	tokenPrivileges.Privileges[0].Luid = luid;
+	tokenPrivileges.Privileges[0].Luid = debugPrivilageLUID;
 	tokenPrivileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+	AdjustTokenPrivileges(currentToken, FALSE, &tokenPrivileges, sizeof(TOKEN_PRIVILEGES), NULL, NULL);
 
-	if (!AdjustTokenPrivileges(hToken, FALSE, &tokenPrivileges, sizeof(TOKEN_PRIVILEGES), NULL, NULL)) {
-		CloseHandle(hToken);
-		return false;
-	}
-
-	if (GetLastError() == ERROR_NOT_ALL_ASSIGNED) {
-		CloseHandle(hToken);
-		return false;
-	}
-
-	CloseHandle(hToken);
-	return true;
+	// Cleanup and return.
+	CloseHandle(currentToken);
 }
 
-bool IsAdmin()
+BOOL IsAdmin()
 {
-	BOOL isAdmin = FALSE;
+	// Try to get the admin group SID. If that fails return false.
 	PSID adminGroup = NULL;
 	SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
-
-	if (AllocateAndInitializeSid(&ntAuthority, 2,
+	if (!AllocateAndInitializeSid(&ntAuthority, 2,
 		SECURITY_BUILTIN_DOMAIN_RID,
 		DOMAIN_ALIAS_RID_ADMINS,
 		0, 0, 0, 0, 0, 0,
 		&adminGroup))
 	{
-		if (!CheckTokenMembership(NULL, adminGroup, &isAdmin))
-		{
-			isAdmin = FALSE;
-		}
-		FreeSid(adminGroup);
+		return FALSE;
 	}
 
-	return isAdmin;
+	// Try to figure out if we are in the admins groups. If that fails return false.
+	BOOL output = FALSE;
+	if (!CheckTokenMembership(NULL, adminGroup, &output))
+	{
+		FreeSid(adminGroup);
+		return FALSE;
+	}
+
+	// Return the result of the check above.
+	return output;
 }
 
-bool RelaunchAsAdmin()
+void RelaunchAsAdmin()
 {
+	// Get the path to the current exe
 	TCHAR szPath[MAX_PATH];
-	if (GetModuleFileName(NULL, szPath, ARRAYSIZE(szPath)))
-	{
-		SHELLEXECUTEINFO sei = { sizeof(sei) };
-		sei.lpVerb = L"runas";
-		sei.lpFile = szPath;
-		sei.hwnd = NULL;
-		sei.nShow = SW_NORMAL;
-		return ShellExecuteEx(&sei);
-	}
+	GetModuleFileName(NULL, szPath, ARRAYSIZE(szPath));
+
+	// Create a shell execute info to launch the current exe with a UAC prompt.
+	SHELLEXECUTEINFO sei = { sizeof(SHELLEXECUTEINFO) };
+	sei.lpVerb = L"runas";
+	sei.lpFile = szPath;
+	sei.nShow = SW_NORMAL;
+
+	// Launch the shell execute info with the shell.
+	ShellExecuteEx(&sei);
 }
 
 int main() {
 	if (!IsAdmin()) {
-		if (!RelaunchAsAdmin()) {
-			cerr << "ERROR: Administrator access is required to pause winlogon.exe." << endl;
-			return 1;
-		}
-		else {
-			cout << "Restarting as administrator with UAC." << endl;
-			return 0;
-		}
-	}
-	if (!TakeSEDebugPrivilege()) {
-		cerr << "ERROR: Failed to get debugging privlages." << endl;
-		return 1;
+		RelaunchAsAdmin();
+		return 0;
 	}
 
-	if (!BreakWinlogon()) {
-		cerr << "ERROR: Failed to pause execution of winlogon.exe." << endl;
-		return 1;
-	}
+	TakeSEDebugPrivilege();
+
+	BreakWinlogon();
 
 	return 0;
 }
